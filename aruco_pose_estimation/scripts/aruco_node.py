@@ -61,8 +61,14 @@ from rcl_interfaces.msg import ParameterDescriptor, ParameterType
 class ArucoNode(rclpy.node.Node):
     def __init__(self):
         super().__init__("aruco_node")
+        self.calibration_coeff = None
+        self.distortion_coeff = None
 
+        # Initialize parameters
         self.initialize_parameters()
+
+        # load calibration parameters
+        self.load_calibration_params()
 
         # Make sure we have a valid dictionary id:
         try:
@@ -80,9 +86,7 @@ class ArucoNode(rclpy.node.Node):
         # Set up subscriptions to the camera info and camera image topics
 
         # camera info topic for the camera calibration parameters
-        self.info_sub = self.create_subscription(
-            CameraInfo, self.info_topic, self.info_callback, qos_profile_sensor_data
-        )
+        self.info_sub = self.create_subscription(CameraInfo, self.info_topic, self.info_cb, qos_profile_sensor_data)
 
         # select the type of input to use for the pose estimation
         if (bool(self.use_depth_input)):
@@ -104,9 +108,7 @@ class ArucoNode(rclpy.node.Node):
             # rely only on the rgb image topic for the pose estimation
 
             # create a subscription to the image topic
-            self.image_sub = self.create_subscription(
-                Image, self.image_topic, self.image_callback, qos_profile_sensor_data
-            )
+            self.image_sub = self.create_subscription(Image, self.image_topic, self.image_cb, qos_profile_sensor_data)
 
         # Set up publishers
         self.poses_pub = self.create_publisher(PoseArray, self.markers_visualization_topic, 10)
@@ -115,120 +117,19 @@ class ArucoNode(rclpy.node.Node):
 
         # Set up fields for camera parameters
         self.info_msg = None
-        self.intrinsic_mat = None
-        self.distortion = None
 
         # code for updated version of cv2 (4.7.0)
-        self.aruco_dictionary = cv2.aruco.getPredefinedDictionary(dictionary_id)
-        self.aruco_parameters = cv2.aruco.DetectorParameters()
-        self.aruco_detector = cv2.aruco.ArucoDetector(self.aruco_dictionary, self.aruco_parameters)
-
-        # old code version
-        # self.aruco_dictionary = cv2.aruco.Dictionary_get(dictionary_id)
-        # self.aruco_parameters = cv2.aruco.DetectorParameters_create()
+        if cv2.__version__ >= "4.7.0":
+            self.aruco_dictionary = cv2.aruco.getPredefinedDictionary(dictionary_id)
+            self.aruco_parameters = cv2.aruco.DetectorParameters()
+            self.aruco_detector = cv2.aruco.ArucoDetector(self.aruco_dictionary, self.aruco_parameters)
+        else:
+            # old code version (4.6.0.66 and older)
+            self.aruco_dictionary = cv2.aruco.Dictionary_get(dictionary_id)
+            self.aruco_parameters = cv2.aruco.DetectorParameters_create()
+            self.aruco_detector = None
 
         self.bridge = CvBridge()
-
-    def info_callback(self, info_msg):
-        self.info_msg = info_msg
-        # get the intrinsic matrix and distortion coefficients from the camera info
-        self.intrinsic_mat = np.reshape(np.array(self.info_msg.k), (3, 3))
-        self.distortion = np.array(self.info_msg.d)
-
-        self.get_logger().info("Camera info received.")
-        self.get_logger().info("Intrinsic matrix: {}".format(self.intrinsic_mat))
-        self.get_logger().info("Distortion coefficients: {}".format(self.distortion))
-        self.get_logger().info("Camera frame: {}x{}".format(self.info_msg.width, self.info_msg.height))
-
-        # Assume that camera parameters will remain the same...
-        self.destroy_subscription(self.info_sub)
-
-    def image_callback(self, img_msg: Image):
-        if self.info_msg is None:
-            self.get_logger().warn("No camera info has been received!")
-            return
-
-        # convert the image messages to cv2 format
-        cv_image = self.bridge.imgmsg_to_cv2(img_msg, desired_encoding="rgb8")
-
-        # create the ArucoMarkers and PoseArray messages
-        markers = ArucoMarkers()
-        pose_array = PoseArray()
-
-        # Set the frame id and timestamp for the markers and pose array
-        if self.camera_frame == "":
-            markers.header.frame_id = self.info_msg.header.frame_id
-            pose_array.header.frame_id = self.info_msg.header.frame_id
-        else:
-            markers.header.frame_id = self.camera_frame
-            pose_array.header.frame_id = self.camera_frame
-
-        markers.header.stamp = img_msg.header.stamp
-        pose_array.header.stamp = img_msg.header.stamp
-
-        """
-        # OVERRIDE: use calibrated intrinsic matrix and distortion coefficients
-        self.intrinsic_mat = np.reshape([615.95431, 0., 325.26983,
-                                         0., 617.92586, 257.57722,
-                                         0., 0., 1.], (3, 3))
-        self.distortion = np.array([0.142588, -0.311967, 0.003950, -0.006346, 0.000000])
-        """
-        
-        # call the pose estimation function
-        frame, pose_array, markers = pose_estimation(rgb_frame=cv_image, depth_frame=None,
-                                                     aruco_detector=self.aruco_detector,
-                                                     marker_size=self.marker_size, matrix_coefficients=self.intrinsic_mat,
-                                                     distortion_coefficients=self.distortion, pose_array=pose_array, markers=markers)
-
-        # if some markers are detected
-        if len(markers.marker_ids) > 0:
-            # Publish the results with the poses and markes positions
-            self.poses_pub.publish(pose_array)
-            self.markers_pub.publish(markers)
-
-        # publish the image frame with computed markers positions over the image
-        self.image_pub.publish(self.bridge.cv2_to_imgmsg(frame, "rgb8"))
-
-    def depth_image_callback(self, depth_msg: Image):
-        if self.info_msg is None:
-            self.get_logger().warn("No camera info has been received!")
-            return
-
-    def rgb_depth_sync_callback(self, rgb_msg: Image, depth_msg: Image):
-
-        # convert the image messages to cv2 format
-        cv_depth_image = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding="16UC1")
-        cv_image = self.bridge.imgmsg_to_cv2(rgb_msg, desired_encoding="rgb8")
-
-        # create the ArucoMarkers and PoseArray messages
-        markers = ArucoMarkers()
-        pose_array = PoseArray()
-
-        # Set the frame id and timestamp for the markers and pose array
-        if self.camera_frame == "":
-            markers.header.frame_id = self.info_msg.header.frame_id
-            pose_array.header.frame_id = self.info_msg.header.frame_id
-        else:
-            markers.header.frame_id = self.camera_frame
-            pose_array.header.frame_id = self.camera_frame
-
-        markers.header.stamp = rgb_msg.header.stamp
-        pose_array.header.stamp = rgb_msg.header.stamp
-
-        # call the pose estimation function
-        frame, pose_array, markers = pose_estimation(rgb_frame=cv_image, depth_frame=cv_depth_image,
-                                                     aruco_detector=self.aruco_detector,
-                                                     marker_size=self.marker_size, matrix_coefficients=self.intrinsic_mat,
-                                                     distortion_coefficients=self.distortion, pose_array=pose_array, markers=markers)
-
-        # if some markers are detected
-        if len(markers.marker_ids) > 0:
-            # Publish the results with the poses and markes positions
-            self.poses_pub.publish(pose_array)
-            self.markers_pub.publish(markers)
-
-        # publish the image frame with computed markers positions over the image
-        self.image_pub.publish(self.bridge.cv2_to_imgmsg(frame, "rgb8"))
 
     def initialize_parameters(self):
         # Declare and read parameters from aruco_params.yaml
@@ -243,7 +144,7 @@ class ArucoNode(rclpy.node.Node):
 
         self.declare_parameter(
             name="aruco_dictionary_id",
-            value="DICT_5X5_250",
+            value="DICT_5X5_100",
             descriptor=ParameterDescriptor(
                 type=ParameterType.PARAMETER_STRING,
                 description="Dictionary that was used to generate markers.",
@@ -252,7 +153,7 @@ class ArucoNode(rclpy.node.Node):
 
         self.declare_parameter(
             name="use_depth_input",
-            value=True,
+            value=False,
             descriptor=ParameterDescriptor(
                 type=ParameterType.PARAMETER_BOOL,
                 description="Use depth camera input for pose estimation instead of RGB image",
@@ -322,6 +223,24 @@ class ArucoNode(rclpy.node.Node):
             ),
         )
 
+        self.declare_parameter(
+            name="calibration_coefficients_file",
+            value="",
+            descriptor=ParameterDescriptor(
+                type=ParameterType.PARAMETER_STRING,
+                description=".npy file containing the camera calibration matrix",
+            ),
+        )
+
+        self.declare_parameter(
+            name="distortion_coefficients_file",
+            value="",
+            descriptor=ParameterDescriptor(
+                type=ParameterType.PARAMETER_STRING,
+                description=".npy file containing the camera distortion coefficients",
+            ),
+        )
+
         # read parameters from aruco_params.yaml and store them
         self.marker_size = (
             self.get_parameter("marker_size").get_parameter_value().double_value
@@ -370,6 +289,125 @@ class ArucoNode(rclpy.node.Node):
         self.output_image_topic = (
             self.get_parameter("output_image_topic").get_parameter_value().string_value
         )
+
+    def load_calibration_params(self):
+        calibration_file = self.get_parameter("calibration_coefficients_file").get_parameter_value().string_value
+        distortion_file = self.get_parameter("distortion_coefficients_file").get_parameter_value().string_value
+
+        # load the calibration matrix and distortion coefficients from the files
+        try:
+            self.calibration_coeff = np.load(calibration_file)
+            self.distortion_coeff = np.load(distortion_file)
+            self.get_logger().info("Camera calibration parameters loaded.")
+            self.get_logger().info("Calibration coefficients: {}".format(self.calibration_coeff))
+            self.get_logger().info("Distortion coefficients: {}".format(self.distortion_coeff))
+        except Exception as e:
+            self.get_logger().error("Error loading calibration parameters: {}".format(e))
+
+    def info_cb(self, info_msg):
+        self.info_msg = info_msg
+        # get the intrinsic matrix and distortion coefficients from the camera info
+        self.intrinsic_mat = np.reshape(np.array(self.info_msg.k), (3, 3))
+        self.distortion = np.array(self.info_msg.d)
+
+        self.get_logger().info("Camera info received.")
+        self.get_logger().info("Intrinsic matrix: {}".format(self.intrinsic_mat))
+        self.get_logger().info("Distortion coefficients: {}".format(self.distortion))
+        self.get_logger().info("Camera frame: {}x{}".format(self.info_msg.width, self.info_msg.height))
+
+        # Assume that camera parameters will remain the same...
+        self.destroy_subscription(self.info_sub)
+
+    def image_cb(self, img_msg: Image):
+        #if self.info_msg is None:
+        #    self.get_logger().warn("No camera info has been received!")
+        #    return
+
+        # convert the image messages to cv2 format
+        cv_image = self.bridge.imgmsg_to_cv2(img_msg, desired_encoding="rgb8")
+
+        # create the ArucoMarkers and PoseArray messages
+        markers = ArucoMarkers()
+        pose_array = PoseArray()
+
+        # Set the frame id and timestamp for the markers and pose array
+        if self.camera_frame == "":
+            markers.header.frame_id = self.info_msg.header.frame_id
+            pose_array.header.frame_id = self.info_msg.header.frame_id
+        else:
+            markers.header.frame_id = self.camera_frame
+            pose_array.header.frame_id = self.camera_frame
+
+        markers.header.stamp = img_msg.header.stamp
+        pose_array.header.stamp = img_msg.header.stamp
+
+        """
+        # DEBUG OVERRIDE: use calibrated intrinsic matrix and distortion coefficients
+        self.intrinsic_mat = np.reshape([615.95431, 0., 325.26983,
+                                         0., 617.92586, 257.57722,
+                                         0., 0., 1.], (3, 3))
+        self.distortion = np.array([0.142588, -0.311967, 0.003950, -0.006346, 0.000000])
+        """
+
+        # call the pose estimation function
+        frame, pose_array, markers = pose_estimation(frame=cv_image,
+                                                     aruco_dict_type=self.aruco_dictionary,
+                                                     aruco_params=self.aruco_parameters,
+                                                     aruco_detector=self.aruco_detector,
+                                                     marker_size=self.marker_size,
+                                                     calibration_coeff=self.calibration_coeff,
+                                                     distortion_coeff=self.distortion_coeff,
+                                                     pose_array=pose_array,
+                                                     markers=markers)
+
+        if len(markers.marker_ids) > 0:
+            # Publish the results with the poses and markes positions
+            self.poses_pub.publish(pose_array)
+            self.markers_pub.publish(markers)
+
+        # publish the image frame with computed markers positions over the image
+        self.image_pub.publish(self.bridge.cv2_to_imgmsg(frame, "rgb8"))
+
+    def depth_image_callback(self, depth_msg: Image):
+        if self.info_msg is None:
+            self.get_logger().warn("No camera info has been received!")
+            return
+
+    def rgb_depth_sync_callback(self, rgb_msg: Image, depth_msg: Image):
+
+        # convert the image messages to cv2 format
+        cv_depth_image = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding="16UC1")
+        cv_image = self.bridge.imgmsg_to_cv2(rgb_msg, desired_encoding="rgb8")
+
+        # create the ArucoMarkers and PoseArray messages
+        markers = ArucoMarkers()
+        pose_array = PoseArray()
+
+        # Set the frame id and timestamp for the markers and pose array
+        if self.camera_frame == "":
+            markers.header.frame_id = self.info_msg.header.frame_id
+            pose_array.header.frame_id = self.info_msg.header.frame_id
+        else:
+            markers.header.frame_id = self.camera_frame
+            pose_array.header.frame_id = self.camera_frame
+
+        markers.header.stamp = rgb_msg.header.stamp
+        pose_array.header.stamp = rgb_msg.header.stamp
+
+        # call the pose estimation function
+        frame, pose_array, markers = pose_estimation(rgb_frame=cv_image, depth_frame=cv_depth_image,
+                                                     aruco_detector=self.aruco_detector,
+                                                     marker_size=self.marker_size, matrix_coefficients=self.intrinsic_mat,
+                                                     distortion_coefficients=self.distortion, pose_array=pose_array, markers=markers)
+
+        # if some markers are detected
+        if len(markers.marker_ids) > 0:
+            # Publish the results with the poses and markes positions
+            self.poses_pub.publish(pose_array)
+            self.markers_pub.publish(markers)
+
+        # publish the image frame with computed markers positions over the image
+        self.image_pub.publish(self.bridge.cv2_to_imgmsg(frame, "rgb8"))
 
 
 def main():

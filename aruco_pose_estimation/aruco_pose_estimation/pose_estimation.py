@@ -8,9 +8,6 @@ import numpy as np
 import cv2
 import tf_transformations
 
-# ROS2 imports
-from rclpy.impl import rcutils_logger
-
 # ROS2 message imports
 from geometry_msgs.msg import Pose
 from geometry_msgs.msg import PoseArray
@@ -20,100 +17,77 @@ from aruco_interfaces.msg import ArucoMarkers
 from aruco_pose_estimation.utils import aruco_display
 
 
-def pose_estimation(rgb_frame: np.array, depth_frame: np.array, aruco_detector: cv2.aruco.ArucoDetector, marker_size: float,
-                    matrix_coefficients: np.array, distortion_coefficients: np.array,
-                    pose_array: PoseArray, markers: ArucoMarkers) -> list[np.array, PoseArray, ArucoMarkers]:
-    '''
-    rgb_frame - Frame from the RGB camera stream
-    depth_frame - Depth frame from the depth camera stream
-    matrix_coefficients - Intrinsic matrix of the calibrated camera
-    distortion_coefficients - Distortion coefficients associated with your camera
-    pose_array - PoseArray message to be published
-    markers - ArucoMarkers message to be published
+def pose_estimation(frame, aruco_dict_type, aruco_params, aruco_detector, marker_size, calibration_coeff, distortion_coeff, pose_array, markers):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-    return:-
-    frame - The frame with the axis drawn on it
-    pose_array - PoseArray with computed poses of the markers
-    markers - ArucoMarkers message containing markers id number and pose
-    '''
+    if aruco_detector is None:
+        (corners, marker_ids, rejected) = cv2.aruco.detectMarkers(gray, aruco_dict_type, parameters=aruco_params)
+    else:
+        # new code version
+        corners, marker_ids, rejected = aruco_detector.detectMarkers(image=gray)
 
-    # old code version
-    # parameters = cv2.aruco.DetectorParameters_create()
-    # corners, marker_ids, _ = cv2.aruco.detectMarkers(frame, aruco_dict_type, parameters=parameters)
-
-    # new code version
-    corners, marker_ids, rejected = aruco_detector.detectMarkers(image=rgb_frame)
-
-    frame_processed = rgb_frame
-    logger = rcutils_logger.RcutilsLogger(name="aruco_node")
-
-    # If markers are detected
-    if len(corners) > 0:
-
-        logger.debug("Detected {} markers.".format(len(corners)))
-
+    frame_processed = frame
+    if marker_ids is not None:
         for i, marker_id in enumerate(marker_ids):
-            # Estimate pose of each marker and return the values rvec and tvec
+            try:
+                # Fix corners if the shape is wrong
+                if corners[i].shape != (4, 1, 2):
+                    corners[i] = corners[i].reshape((1, 4, 2))
+                corners[i] = np.array(corners[i], dtype=np.float32)
 
-            # using deprecated function
-            # rvec, tvec, markerPoints = cv2.aruco.estimatePoseSingleMarkers(corners=corners[i],
-            #                                                               markerLength=marker_size,
-            #                                                               cameraMatrix=matrix_coefficients,
-            #                                                               distCoeffs=distortion_coefficients)
-            # tvec = tvec[0]
+                # Ensure inputs are numpy arrays with the correct type
+                calibration_coeff = np.array(calibration_coeff, dtype=np.float32)
+                distortion_coeff = np.array(distortion_coeff, dtype=np.float32)
 
-            # alternative code version using solvePnP
-            tvec, rvec, quat = my_estimatePoseSingleMarkers(corners=corners[i], marker_size=marker_size,
-                                                                    camera_matrix=matrix_coefficients,
-                                                                    distortion=distortion_coefficients)
+                # Estimate pose of each marker and return the values rvec and tvec
+                rvec, tvec, markerPoints = cv2.aruco.estimatePoseSingleMarkers(corners[i], marker_size, calibration_coeff, distortion_coeff)
+                rvec = rvec.reshape(3, 1)
+                tvec = tvec.reshape(3, 1)
 
-            # show the detected markers bounding boxes
-            frame_processed = aruco_display(corners=corners, ids=marker_ids,
-                                            image=frame_processed)
+                rot, jacobian = cv2.Rodrigues(rvec)
+                rot_matrix = np.eye(4, dtype=np.float32)
+                rot_matrix[0:3, 0:3] = rot
 
-            # draw frame axes
-            frame_processed = cv2.drawFrameAxes(image=frame_processed, cameraMatrix=matrix_coefficients,
-                                                distCoeffs=distortion_coefficients, rvec=rvec, tvec=tvec,
-                                                length=0.05, thickness=3)
+                # convert rotation matrix to quaternion
+                quaternion = tf_transformations.quaternion_from_matrix(rot_matrix)
+                norm_quat = np.linalg.norm(quaternion)
+                quat = quaternion / norm_quat
 
-            if (depth_frame is not None):
-                # get the centroid of the pointcloud
-                centroid = depth_to_pointcloud_centroid(depth_image=depth_frame,
-                                                        intrinsic_matrix=matrix_coefficients,
-                                                        corners=corners[i])
+                # alternative code version using solvePnP
+                #tvec, rvec, quat = my_estimatePoseSingleMarkers(corners=corners[i], marker_size=marker_size,
+                #                                                        camera_matrix=matrix_coefficients,
+                #                                                        distortion=distortion_coefficients)
 
-                # log comparison between depthcloud centroid and tvec estimated positions
-                logger.info(f"depthcloud centroid = {centroid}")
-                logger.info(f"tvec = {tvec[0]} {tvec[1]} {tvec[2]}")
+                # show the detected markers bounding boxes
+                frame_processed = aruco_display(corners=corners, ids=marker_ids,
+                                                image=frame_processed)
 
-            # compute pose from the rvec and tvec arrays
-            if (depth_frame is not None):
-                # use computed centroid from depthcloud as estimated pose
-                pose = Pose()
-                pose.position.x = float(centroid[0])
-                pose.position.y = float(centroid[1])
-                pose.position.z = float(centroid[2])
-            else:
-                # use tvec from aruco estimator as estimated pose
+                # draw frame axes
+                frame_processed = cv2.drawFrameAxes(image=frame_processed, cameraMatrix=calibration_coeff,
+                                                    distCoeffs=distortion_coeff, rvec=rvec, tvec=tvec,
+                                                    length=0.05, thickness=3)
+
                 pose = Pose()
                 pose.position.x = float(tvec[0])
                 pose.position.y = float(tvec[1])
                 pose.position.z = float(tvec[2])
+                pose.orientation.x = quat[0]
+                pose.orientation.y = quat[1]
+                pose.orientation.z = quat[2]
+                pose.orientation.w = quat[3]
 
-            pose.orientation.x = quat[0]
-            pose.orientation.y = quat[1]
-            pose.orientation.z = quat[2]
-            pose.orientation.w = quat[3]
+                # add the pose and marker id to the pose_array and markers messages
+                pose_array.poses.append(pose)
+                markers.poses.append(pose)
+                markers.marker_ids.append(marker_id[0])
 
-            # add the pose and marker id to the pose_array and markers messages
-            pose_array.poses.append(pose)
-            markers.poses.append(pose)
-            markers.marker_ids.append(marker_id[0])
+            except Exception as e:
+                print(f"Error: {e}")
+                continue
 
     return frame_processed, pose_array, markers
 
-
-def my_estimatePoseSingleMarkers(corners, marker_size, camera_matrix, distortion) -> tuple[np.array, np.array, np.array]:
+def my_estimatePoseSingleMarkers(corners, marker_size, camera_matrix, distortion):# -> tuple[np.array, np.array, np.array]:
     '''
     This will estimate the rvec and tvec for each of the marker corners detected by:
        corners, ids, rejectedImgPoints = detector.detectMarkers(image)
@@ -124,6 +98,10 @@ def my_estimatePoseSingleMarkers(corners, marker_size, camera_matrix, distortion
     distortion - is the camera distortion matrix
     RETURN list of rvecs, tvecs, and trash (so that it corresponds to the old estimatePoseSingleMarkers())
     '''
+    print("Camera Matrix:", camera_matrix)
+    print("Type:", type(camera_matrix))
+    print("Shape:", camera_matrix.shape if hasattr(camera_matrix, 'shape') else 'Not a numpy array')
+
     marker_points = np.array([[-marker_size / 2.0, marker_size / 2.0, 0],
                               [marker_size / 2.0, marker_size / 2.0, 0],
                               [marker_size / 2.0, -marker_size / 2.0, 0],

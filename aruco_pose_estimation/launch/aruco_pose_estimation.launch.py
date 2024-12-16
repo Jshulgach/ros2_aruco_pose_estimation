@@ -88,6 +88,26 @@ def generate_launch_description():
         description='Name of the topic to publish the image with the detected markers',
     )
 
+    calibration_coefficients_file_arg = DeclareLaunchArgument(
+        name='calibration_coefficients_file',
+        default_value=config['calibration_coefficients_file'],
+        description='Path to the camera calibration coefficients matrix file',
+    )
+
+    distortion_coefficients_file_arg = DeclareLaunchArgument(
+        name='distortion_coefficients_file',
+        default_value=config['distortion_coefficients_file'],
+        description='Camera distortion coefficients file',
+    )
+
+    launch_rviz_arg = DeclareLaunchArgument(
+        name='launch_rviz',
+        default_value='false',
+        description='Launch RViz',
+        choices=['true', 'false', 'True', 'False']
+    )
+    launch_rviz = LaunchConfiguration('launch_rviz')
+
     aruco_node = Node(
         package='aruco_pose_estimation',
         executable='aruco_node.py',
@@ -102,37 +122,39 @@ def generate_launch_description():
             "detected_markers_topic": LaunchConfiguration('detected_markers_topic'),
             "markers_visualization_topic": LaunchConfiguration('markers_visualization_topic'),
             "output_image_topic": LaunchConfiguration('output_image_topic'),
+            "calibration_coefficients_file": LaunchConfiguration('calibration_coefficients_file'),
+            "distortion_coefficients_file": LaunchConfiguration('distortion_coefficients_file'),
         }],
         output='screen',
         emulate_tty=True
     )
 
     # launch realsense camera node
-    cam_feed_launch_file = PathJoinSubstitution(
-        [FindPackageShare("realsense2_camera"), "launch", "rs_launch.py"]
-    )
+    #cam_feed_launch_file = PathJoinSubstitution(
+    #    [FindPackageShare("realsense2_camera"), "launch", "rs_launch.py"]
+    #)
 
-    camera_feed_depth_node = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(cam_feed_launch_file),
-        launch_arguments={
-            "pointcloud.enable": "true",
-            "enable_rgbd": "true",
-            "enable_sync": "true",
-            "align_depth.enable": "true",
-            "enable_color": "true",
-            "enable_depth": "true",
-        }.items(),
-        condition=IfCondition(LaunchConfiguration('use_depth_input'))
-    )
+    #camera_feed_depth_node = IncludeLaunchDescription(
+    #    PythonLaunchDescriptionSource(cam_feed_launch_file),
+    #    launch_arguments={
+    #        "pointcloud.enable": "true",
+    #        "enable_rgbd": "true",
+    #        "enable_sync": "true",
+    #        "align_depth.enable": "true",
+    #        "enable_color": "true",
+    #        "enable_depth": "true",
+    #    }.items(),
+    #    condition=IfCondition(LaunchConfiguration('use_depth_input'))
+    #)
 
-    camera_feed_node = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(cam_feed_launch_file),
-        launch_arguments={
-            "pointcloud.enable": "true",
-            "enable_color": "true",
-        }.items(),
-        condition=UnlessCondition(LaunchConfiguration('use_depth_input'))
-    )
+    #camera_feed_node = IncludeLaunchDescription(
+    #    PythonLaunchDescriptionSource(cam_feed_launch_file),
+    #    launch_arguments={
+    #        "pointcloud.enable": "true",
+    #        "enable_color": "true",
+    #    }.items(),
+    #    condition=UnlessCondition(LaunchConfiguration('use_depth_input'))
+    #)
 
     rviz_file = PathJoinSubstitution([
         FindPackageShare('aruco_pose_estimation'),
@@ -142,6 +164,7 @@ def generate_launch_description():
 
     rviz2_node = Node(
         package='rviz2',
+        condition=IfCondition(launch_rviz),
         executable='rviz2',
         arguments=['-d', rviz_file]
     )
@@ -158,10 +181,13 @@ def generate_launch_description():
         detected_markers_topic_arg,
         markers_visualization_topic_arg,
         output_image_topic_arg,
+        calibration_coefficients_file_arg,
+        distortion_coefficients_file_arg,
+        launch_rviz_arg,
 
         # Nodes
         aruco_node, 
-        camera_feed_depth_node,
-        camera_feed_node,
+        #camera_feed_depth_node,
+        #camera_feed_node,
         rviz2_node
     ])
