@@ -26,7 +26,8 @@ ament_python_install_package(${PROJECT_NAME})
 
 # Install Python executables
 install(PROGRAMS
-    scripts/aruco_node.py
+    scripts/aruco_pose_estimation_node.py
+    scripts/aruco_broadcaster_node.py
     DESTINATION lib/${PROJECT_NAME}
 )
 

@@ -1,13 +1,6 @@
 # Aruco Pose Estimation with ROS2, using RGB and Depth camera images from Realsense D435
 
-Code developed by: __Simone Giampà__
-
-Project and experimentation conducted at __Politecnico di Milano, Artificial Intelligence and Robotics Laboratory, 2024__
-
-_Project part of my Master's Thesis project at Politecnico di Milano, Italy._
-
-ROS2 wrapper for Aruco marker detection and pose estimation, using OpenCV library. The marker detection and pose estimation is
-done using RGB and optionally Depth images. This package works for ROS2 Humble and Iron.
+ROS2 wrapper for Aruco marker detection and pose estimation, using OpenCV library. Compatible with ROS2 Foxy, Galactic, Humble, Iron, and Jazzy.
 
 This package allows to use cameras to detect Aruco markers and estimate their poses. It allows to use any camera with ROS2 drivers.
 The code is a ROS2 publisher-subscriber working with RGB camera images for marker detection and RGB or depth images for pose estimation. 

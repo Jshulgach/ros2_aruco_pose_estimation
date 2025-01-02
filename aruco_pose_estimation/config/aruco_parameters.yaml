@@ -1,7 +1,7 @@
 /aruco_node:
     ros__parameters:
         # Aruco detection parameters
-        marker_size: 0.02 # Size of the markers in meters
+        marker_size: 0.04 # Size of the markers in meters
         aruco_dictionary_id: DICT_5X5_100 # Aruco dictionary type
         calibration_coefficients_file: /home/jonathan/realbotics_ws/src/ros2_aruco_pose_estimation/aruco_pose_estimation/config/calibration_coefficients.npy
         distortion_coefficients_file: /home/jonathan/realbotics_ws/src/ros2_aruco_pose_estimation/aruco_pose_estimation/config/distortion_coefficients.npy
@@ -15,3 +15,12 @@
         detected_markers_topic: /aruco/markers # Output topic with detected markers (aruco poses + ids)
         markers_visualization_topic: /aruco/poses # Output topic with visualization of detected markers as pose array
         output_image_topic: /aruco/image # Output topic with visualization of detected markers drawn on image
+
+        # Origin pose parameters. Set these up after calibrating the camera
+        origin_marker_id: 15 # Aruco marker id of the origin
+        origin_position: [ 0.0, 0.0, 0.0 ] # Origin position in camera frame
+        origin_orientation: [ 0.0, 0.0, 0.0, 1.0 ] # Origin orientation in camera frame
+        #origin_position: [-0.5305755956905019,-0.11137063049305672,1.5985514520331214] # Origin position in camera frame
+        #origin_orientation: [-0.983758226212538,0.011447687498133215,-0.11958529310691496,0.133371887902359] # Origin orientation in camera frame
+        #origin_position: [-0.299266, -0.139685, 1.132642] # Origin position in camera frame
+        #origin_orientation: [-0.9864035, 0.0228318, 0.1393812, 0.0840226] # Origin orientation in camera frame

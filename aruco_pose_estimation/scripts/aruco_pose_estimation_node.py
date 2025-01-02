@@ -6,7 +6,7 @@ https://github.com/JMU-ROBOTICS-VIVA/ros2_aruco/tree/main
 This node locates Aruco AR markers in images and publishes their ids and poses.
 
 Subscriptions:
-   /camera/image_raw (sensor_msgs.msg.Image)
+   /camera/color/image_raw (sensor_msgs.msg.Image)
    /camera/camera_info (sensor_msgs.msg.CameraInfo)
 
 Published Topics:
@@ -30,8 +30,8 @@ Parameters:
     markers_visualization_topic - topic to publish markers visualization (default /aruco_poses)
     output_image_topic - topic to publish annotated image (default /aruco_image)
 
-Author: Simone Giampà
-Version: 2024-01-29
+Author: Simone Giampà. Version: 2024-01-29
+Modified by: Jonathan Shulgach, Version: 2024-12-24
 
 """
 
@@ -43,17 +43,18 @@ from cv_bridge import CvBridge
 import message_filters
 
 # Python imports
-import numpy as np
 import cv2
+import numpy as np
+from scipy.spatial.transform import Rotation as R
 
 # Local imports for custom defined functions
 from aruco_pose_estimation.utils import ARUCO_DICT
-from aruco_pose_estimation.pose_estimation import pose_estimation
+from aruco_pose_estimation.pose_estimation import apply_transform_to_pose, pose_to_matrix, pose_estimation
 
 # ROS2 message imports
 from sensor_msgs.msg import CameraInfo
 from sensor_msgs.msg import Image
-from geometry_msgs.msg import PoseArray
+from geometry_msgs.msg import PoseArray, Pose
 from aruco_interfaces.msg import ArucoMarkers
 from rcl_interfaces.msg import ParameterDescriptor, ParameterType
 
@@ -63,12 +64,16 @@ class ArucoNode(rclpy.node.Node):
         super().__init__("aruco_node")
         self.calibration_coeff = None
         self.distortion_coeff = None
+        self.origin_transform = None
 
-        # Initialize parameters
+        # Initialize ROS2 parameters
         self.initialize_parameters()
 
-        # load calibration parameters
-        self.load_calibration_params()
+        # Load the camera calibration parameters
+        self.load_calibration_parameters()
+
+        # Set the origin transformation from the parameters
+        self.set_origin_from_parameters()
 
         # Make sure we have a valid dictionary id:
         try:
@@ -77,38 +82,12 @@ class ArucoNode(rclpy.node.Node):
             if dictionary_id not in ARUCO_DICT.values():
                 raise AttributeError
         except AttributeError:
-            self.get_logger().error(
-                "bad aruco_dictionary_id: {}".format(self.dictionary_id_name)
-            )
+            self.get_logger().error("bad aruco_dictionary_id: {}".format(self.dictionary_id_name))
             options = "\n".join([s for s in ARUCO_DICT])
             self.get_logger().error("valid options: {}".format(options))
 
         # Set up subscriptions to the camera info and camera image topics
-
-        # camera info topic for the camera calibration parameters
-        self.info_sub = self.create_subscription(CameraInfo, self.info_topic, self.info_cb, qos_profile_sensor_data)
-
-        # select the type of input to use for the pose estimation
-        if (bool(self.use_depth_input)):
-            # use both rgb and depth image topics for the pose estimation
-
-            # create a message filter to synchronize the image and depth image topics
-            self.image_sub = message_filters.Subscriber(self, Image, self.image_topic,
-                                                        qos_profile=qos_profile_sensor_data)
-            self.depth_image_sub = message_filters.Subscriber(self, Image, self.depth_image_topic,
-                                                              qos_profile=qos_profile_sensor_data)
-
-            # create synchronizer between the 2 topics using message filters and approximate time policy
-            # slop is the maximum time difference between messages that are considered synchronized
-            self.synchronizer = message_filters.ApproximateTimeSynchronizer(
-                [self.image_sub, self.depth_image_sub], queue_size=10, slop=0.05
-            )
-            self.synchronizer.registerCallback(self.rgb_depth_sync_callback)
-        else:
-            # rely only on the rgb image topic for the pose estimation
-
-            # create a subscription to the image topic
-            self.image_sub = self.create_subscription(Image, self.image_topic, self.image_cb, qos_profile_sensor_data)
+        self.image_sub = self.create_subscription(Image, self.image_topic, self.image_cb, qos_profile_sensor_data)
 
         # Set up publishers
         self.poses_pub = self.create_publisher(PoseArray, self.markers_visualization_topic, 10)
@@ -152,29 +131,11 @@ class ArucoNode(rclpy.node.Node):
         )
 
         self.declare_parameter(
-            name="use_depth_input",
-            value=False,
-            descriptor=ParameterDescriptor(
-                type=ParameterType.PARAMETER_BOOL,
-                description="Use depth camera input for pose estimation instead of RGB image",
-            ),
-        )
-
-        self.declare_parameter(
             name="image_topic",
-            value="/camera/image_raw",
+            value="/camera/color/image_raw",
             descriptor=ParameterDescriptor(
                 type=ParameterType.PARAMETER_STRING,
                 description="Image topic to subscribe to.",
-            ),
-        )
-
-        self.declare_parameter(
-            name="depth_image_topic",
-            value="/camera/depth/image_raw",
-            descriptor=ParameterDescriptor(
-                type=ParameterType.PARAMETER_STRING,
-                description="Depth camera topic to subscribe to.",
             ),
         )
 
@@ -241,87 +202,61 @@ class ArucoNode(rclpy.node.Node):
             ),
         )
 
+        self.declare_parameter(
+            name="origin_position",
+            value=[0.0, 0.0, 0.0],  # Default position
+            descriptor=ParameterDescriptor(
+                type=ParameterType.PARAMETER_DOUBLE_ARRAY,
+                description="Origin position [x, y, z] in meters."
+            )
+        )
+
+        self.declare_parameter(
+            name="origin_orientation",
+            value=[0.0, 0.0, 0.0, 1.0],  # Default quaternion [x, y, z, w]
+            descriptor=ParameterDescriptor(
+                type=ParameterType.PARAMETER_DOUBLE_ARRAY,
+                description="Origin orientation [x, y, z, w] quaternion."
+            )
+        )
+
         # read parameters from aruco_params.yaml and store them
-        self.marker_size = (
-            self.get_parameter("marker_size").get_parameter_value().double_value
-        )
+        self.marker_size = self.get_parameter("marker_size").get_parameter_value().double_value
+        self.dictionary_id_name = self.get_parameter("aruco_dictionary_id").get_parameter_value().string_value
+        self.image_topic = self.get_parameter("image_topic").get_parameter_value().string_value
+        self.camera_frame = self.get_parameter("camera_frame").get_parameter_value().string_value
+        self.detected_markers_topic = self.get_parameter("detected_markers_topic").get_parameter_value().string_value
+        self.markers_visualization_topic = self.get_parameter("markers_visualization_topic").get_parameter_value().string_value
+        self.output_image_topic = self.get_parameter("output_image_topic").get_parameter_value().string_value
+        self.origin_position = self.get_parameter("origin_position").get_parameter_value().double_array_value
+        self.origin_orientation = self.get_parameter("origin_orientation").get_parameter_value().double_array_value
+
         self.get_logger().info(f"Marker size: {self.marker_size}")
-
-        self.dictionary_id_name = (
-            self.get_parameter("aruco_dictionary_id").get_parameter_value().string_value
-        )
-        self.get_logger().info(f"Marker type: {self.dictionary_id_name}")
-
-        self.use_depth_input = (
-            self.get_parameter("use_depth_input").get_parameter_value().bool_value
-        )
-        self.get_logger().info(f"Use depth input: {self.use_depth_input}")
-
-        self.image_topic = (
-            self.get_parameter("image_topic").get_parameter_value().string_value
-        )
         self.get_logger().info(f"Input image topic: {self.image_topic}")
-
-        self.depth_image_topic = (
-            self.get_parameter("depth_image_topic").get_parameter_value().string_value
-        )
-        self.get_logger().info(f"Input depth image topic: {self.depth_image_topic}")
-
-        self.info_topic = (
-            self.get_parameter("camera_info_topic").get_parameter_value().string_value
-        )
-        self.get_logger().info(f"Image camera info topic: {self.info_topic}")
-
-        self.camera_frame = (
-            self.get_parameter("camera_frame").get_parameter_value().string_value
-        )
         self.get_logger().info(f"Camera frame: {self.camera_frame}")
+        self.get_logger().info(f"Detected markers topic: {self.detected_markers_topic}")
+        self.get_logger().info(f"Markers visualization topic: {self.markers_visualization_topic}")
+        self.get_logger().info(f"Output image topic: {self.output_image_topic}")
+        self.get_logger().info(f"Origin position: {self.origin_position}")
+        self.get_logger().info(f"Origin orientation: {self.origin_orientation}")
 
-        # Output topics
-        self.detected_markers_topic = (
-            self.get_parameter("detected_markers_topic").get_parameter_value().string_value
-        )
-
-        self.markers_visualization_topic = (
-            self.get_parameter("markers_visualization_topic").get_parameter_value().string_value
-        )
-
-        self.output_image_topic = (
-            self.get_parameter("output_image_topic").get_parameter_value().string_value
-        )
-
-    def load_calibration_params(self):
+    def load_calibration_parameters(self):
         calibration_file = self.get_parameter("calibration_coefficients_file").get_parameter_value().string_value
         distortion_file = self.get_parameter("distortion_coefficients_file").get_parameter_value().string_value
+        print("calibration_file: ", calibration_file)
+        print("distortion_file: ", distortion_file)
 
         # load the calibration matrix and distortion coefficients from the files
         try:
             self.calibration_coeff = np.load(calibration_file)
             self.distortion_coeff = np.load(distortion_file)
             self.get_logger().info("Camera calibration parameters loaded.")
-            self.get_logger().info("Calibration coefficients: {}".format(self.calibration_coeff))
+            self.get_logger().info("Calibration coefficients: \n{}".format(self.calibration_coeff))
             self.get_logger().info("Distortion coefficients: {}".format(self.distortion_coeff))
         except Exception as e:
             self.get_logger().error("Error loading calibration parameters: {}".format(e))
 
-    def info_cb(self, info_msg):
-        self.info_msg = info_msg
-        # get the intrinsic matrix and distortion coefficients from the camera info
-        self.intrinsic_mat = np.reshape(np.array(self.info_msg.k), (3, 3))
-        self.distortion = np.array(self.info_msg.d)
-
-        self.get_logger().info("Camera info received.")
-        self.get_logger().info("Intrinsic matrix: {}".format(self.intrinsic_mat))
-        self.get_logger().info("Distortion coefficients: {}".format(self.distortion))
-        self.get_logger().info("Camera frame: {}x{}".format(self.info_msg.width, self.info_msg.height))
-
-        # Assume that camera parameters will remain the same...
-        self.destroy_subscription(self.info_sub)
-
     def image_cb(self, img_msg: Image):
-        #if self.info_msg is None:
-        #    self.get_logger().warn("No camera info has been received!")
-        #    return
 
         # convert the image messages to cv2 format
         cv_image = self.bridge.imgmsg_to_cv2(img_msg, desired_encoding="rgb8")
@@ -335,19 +270,19 @@ class ArucoNode(rclpy.node.Node):
             markers.header.frame_id = self.info_msg.header.frame_id
             pose_array.header.frame_id = self.info_msg.header.frame_id
         else:
+            #markers.header.frame_id = "world"
+            #pose_array.header.frame_id = "/world"
             markers.header.frame_id = self.camera_frame
             pose_array.header.frame_id = self.camera_frame
 
+        # Check if the stamp field sec or nanosec are both zero then add the current time
+        if img_msg.header.stamp.sec == 0 and img_msg.header.stamp.nanosec == 0:
+            img_msg.header.stamp = self.get_clock().now().to_msg()
+        else:
+            img_msg.header.stamp = img_msg.header.stamp
+
         markers.header.stamp = img_msg.header.stamp
         pose_array.header.stamp = img_msg.header.stamp
-
-        """
-        # DEBUG OVERRIDE: use calibrated intrinsic matrix and distortion coefficients
-        self.intrinsic_mat = np.reshape([615.95431, 0., 325.26983,
-                                         0., 617.92586, 257.57722,
-                                         0., 0., 1.], (3, 3))
-        self.distortion = np.array([0.142588, -0.311967, 0.003950, -0.006346, 0.000000])
-        """
 
         # call the pose estimation function
         frame, pose_array, markers = pose_estimation(frame=cv_image,
@@ -361,53 +296,39 @@ class ArucoNode(rclpy.node.Node):
                                                      markers=markers)
 
         if len(markers.marker_ids) > 0:
+            # Transform poses relative to the origin
+            transformed_pose_array = self.transform_all_poses(pose_array)
+
             # Publish the results with the poses and markes positions
-            self.poses_pub.publish(pose_array)
+            self.poses_pub.publish(transformed_pose_array)
             self.markers_pub.publish(markers)
 
         # publish the image frame with computed markers positions over the image
         self.image_pub.publish(self.bridge.cv2_to_imgmsg(frame, "rgb8"))
 
-    def depth_image_callback(self, depth_msg: Image):
-        if self.info_msg is None:
-            self.get_logger().warn("No camera info has been received!")
-            return
+    def set_origin_from_parameters(self):
+        """ Sets th origin transformation using the position and orientation form the parameters. """
+        self.origin_transform = pose_to_matrix(self.origin_position, self.origin_orientation)
+        self.get_logger().info("Origin set to: {}".format(self.origin_transform))
 
-    def rgb_depth_sync_callback(self, rgb_msg: Image, depth_msg: Image):
+    def transform_all_poses(self, pose_array):
+        """
+        Transform all detected marker poses to the origin coordinate frame.
+        :param pose_array: PoseArray to be transformed.
+        :return: Transformed PoseArray.
+        """
+        if self.origin_transform is None:
+            self.get_logger().warn("Origin is not set. Cannot transform poses.")
+            return pose_array  # Return the original array if no origin is set
 
-        # convert the image messages to cv2 format
-        cv_depth_image = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding="16UC1")
-        cv_image = self.bridge.imgmsg_to_cv2(rgb_msg, desired_encoding="rgb8")
+        transformed_pose_array = PoseArray()
+        transformed_pose_array.header = pose_array.header
 
-        # create the ArucoMarkers and PoseArray messages
-        markers = ArucoMarkers()
-        pose_array = PoseArray()
+        for pose in pose_array.poses:
+            transformed_pose = apply_transform_to_pose(pose, self.origin_transform)
+            transformed_pose_array.poses.append(transformed_pose)
 
-        # Set the frame id and timestamp for the markers and pose array
-        if self.camera_frame == "":
-            markers.header.frame_id = self.info_msg.header.frame_id
-            pose_array.header.frame_id = self.info_msg.header.frame_id
-        else:
-            markers.header.frame_id = self.camera_frame
-            pose_array.header.frame_id = self.camera_frame
-
-        markers.header.stamp = rgb_msg.header.stamp
-        pose_array.header.stamp = rgb_msg.header.stamp
-
-        # call the pose estimation function
-        frame, pose_array, markers = pose_estimation(rgb_frame=cv_image, depth_frame=cv_depth_image,
-                                                     aruco_detector=self.aruco_detector,
-                                                     marker_size=self.marker_size, matrix_coefficients=self.intrinsic_mat,
-                                                     distortion_coefficients=self.distortion, pose_array=pose_array, markers=markers)
-
-        # if some markers are detected
-        if len(markers.marker_ids) > 0:
-            # Publish the results with the poses and markes positions
-            self.poses_pub.publish(pose_array)
-            self.markers_pub.publish(markers)
-
-        # publish the image frame with computed markers positions over the image
-        self.image_pub.publish(self.bridge.cv2_to_imgmsg(frame, "rgb8"))
+        return transformed_pose_array
 
 
 def main():

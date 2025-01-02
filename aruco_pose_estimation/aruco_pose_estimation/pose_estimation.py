@@ -199,6 +199,70 @@ def depth_to_pointcloud_centroid(depth_image: np.array, intrinsic_matrix: np.arr
 
     return centroid
 
+def apply_transform_to_pose(pose: Pose, transform: np.array) -> Pose:
+    """
+    This function takes a Pose message and a transformation matrix as input, and returns a new Pose message
+    that is the result of applying the transformation to the original pose.
+
+    Args:
+        pose: A Pose message representing the original pose.
+        transform: A 4x4 numpy array representing the transformation matrix.
+
+    Returns:
+        A Pose message representing the transformed pose.
+    """
+
+    # Convert the position and orientation of the pose to numpy arrays
+    position = np.array([pose.position.x, pose.position.y, pose.position.z], dtype=np.float32)
+    orientation = np.array([pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w], dtype=np.float32)
+
+    # Apply the transformation to the position
+    position_homogeneous = np.append(position, 1.0)  # Convert to homogeneous coordinates
+    position_transformed = np.dot(transform, position_homogeneous)[:3]  # Transform and extract [x, y, z]
+
+    # Apply the transformation to the orientation
+    rot_matrix = tf_transformations.quaternion_matrix(orientation)[:3, :3]  # Extract the 3x3 rotation matrix
+    rot_matrix_transformed = np.dot(transform[:3, :3], rot_matrix)  # Transform the rotation
+    orientation_transformed = tf_transformations.quaternion_from_matrix(
+        np.vstack([np.hstack([rot_matrix_transformed, [[0], [0], [0]]]), [0, 0, 0, 1]])
+    )
+
+    # Create a new Pose message with the transformed position and orientation
+    pose_transformed = Pose()
+    pose_transformed.position.x = position_transformed[0]
+    pose_transformed.position.y = position_transformed[1]
+    pose_transformed.position.z = position_transformed[2]
+    pose_transformed.orientation.x = orientation_transformed[0]
+    pose_transformed.orientation.y = orientation_transformed[1]
+    pose_transformed.orientation.z = orientation_transformed[2]
+    pose_transformed.orientation.w = orientation_transformed[3]
+
+    return pose_transformed
+
+
+def pose_to_matrix(position: np.array, orientation: np.array) -> np.array:
+    """
+    This function takes a position and orientation as input, and returns a 4x4 transformation matrix.
+
+    Args:
+        position: A numpy array representing the position [x, y, z].
+        orientation: A numpy array representing the orientation [x, y, z, w].
+
+    Returns:
+        A 4x4 numpy array representing the transformation matrix.
+    """
+
+    # Create a 4x4 transformation matrix
+    matrix = np.eye(4, dtype=np.float32)
+
+    # Set the position in the transformation matrix
+    matrix[0:3, 3] = position
+
+    # Set the orientation in the transformation matrix
+    rot_matrix = tf_transformations.quaternion_matrix(orientation)
+    matrix[0:3, 0:3] = rot_matrix[0:3, 0:3]
+
+    return matrix
 
 def is_pixel_in_polygon(pixel: tuple, corners: np.array) -> bool:
     """
