@@ -69,7 +69,7 @@ class ArucoTransformPublisher(rclpy.node.Node):
 
             # Broadcast the transform
             self.broadcaster.sendTransform(t)
-            self.get_logger().info(f'Broadcasted transform for marker {msg.marker_ids[i]}')
+            #self.get_logger().info(f'Broadcasted transform for marker {msg.marker_ids[i]}')
 
 
 def main():

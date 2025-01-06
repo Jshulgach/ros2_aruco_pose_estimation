@@ -17,7 +17,7 @@ find_package(rclpy REQUIRED)
 #find_package(open3d REQUIRED)
 #find_package(numpy REQUIRED)
 #find_package(cv2 REQUIRED)
-#find_package(cv_bridge REQUIRED)
+find_package(cv_bridge REQUIRED)
 #find_package(tf_transformations REQUIRED)
 find_package(aruco_interfaces REQUIRED)
 
