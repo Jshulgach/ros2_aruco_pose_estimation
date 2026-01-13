@@ -37,7 +37,8 @@ def generate_launch_description():
         # These pose values are estimated by visual inspection of the webcam position representation of an
         # array of aruco markers placed on the surface around a robot arm.
         #arguments=["0.57", "0.03", "0.86", "1.571", "0.0", "3.69", "world", "camera_color_optical_frame"],
-        arguments=["0.55", "0.0", "0.87", "1.571", "-0.03", "3.69", "world", "camera_color_optical_frame"],
+        #arguments=["0.55", "0.0", "0.87", "1.571", "-0.03", "3.69", "world", "camera_color_optical_frame"],
+        arguments=["0.55", "0.0", "0.87", "0.0", "-0.7", "-0.87", "world", "camera_color_optical_frame"],
     )
 
     # Aruco state publisher

@@ -3,18 +3,22 @@
         # Aruco detection parameters
         marker_size: 0.04 # Size of the markers in meters
         aruco_dictionary_id: DICT_5X5_100 # Aruco dictionary type
-        calibration_coefficients_file: /home/jonathan/realbotics_ws/src/ros2_aruco_pose_estimation/aruco_pose_estimation/config/calibration_coefficients.npy
-        distortion_coefficients_file: /home/jonathan/realbotics_ws/src/ros2_aruco_pose_estimation/aruco_pose_estimation/config/distortion_coefficients.npy
+        #calibration_coefficients_file: /home/jonathan/realbotics_ws/src/ros2_aruco_pose_estimation/aruco_pose_estimation/config/calibration_coefficients.npy
+        #distortion_coefficients_file: /home/jonathan/realbotics_ws/src/ros2_aruco_pose_estimation/aruco_pose_estimation/config/distortion_coefficients.npy
+
         # Input topics
-        image_topic: /camera/color/image_raw # Input image topic
-        use_depth_input: false # Use depth image for 3D pose estimation
-        depth_image_topic: /camera/aligned_depth_to_color/image_raw # Input depth image topic
-        camera_info_topic: /camera/color/camera_info # Input camera info topic with camera intrinsic parameters
+        dual_cameras: true # Use two monocular cameras for stereo 3D pose estimation
+        camera1_image_topic: /camera1/color/image_raw # Input image topic for camera 1
+        camera2_image_topic: /camera2/color/image_raw # Input image topic for camera 2
+        camera1_info_topic: /camera1/color/camera_info # Input camera info topic with camera 1 intrinsic parameters
+        camera2_info_topic: /camera2/color/camera_info # Input camera info topic with camera 2 intrinsic parameters
         camera_frame: camera_color_optical_frame # Camera link frame of reference
+
         # Output topics
         detected_markers_topic: /aruco/markers # Output topic with detected markers (aruco poses + ids)
         markers_visualization_topic: /aruco/poses # Output topic with visualization of detected markers as pose array
-        output_image_topic: /aruco/image # Output topic with visualization of detected markers drawn on image
+        output1_image_topic: /aruco/camera1/image # Output topic with visualization of detected markers drawn on image 1
+        output2_image_topic: /aruco/camera2/image # Output topic with visualization of detected markers drawn on image 2
 
         # Origin pose parameters. Set these up after calibrating the camera
         origin_marker_id: 15 # Aruco marker id of the origin

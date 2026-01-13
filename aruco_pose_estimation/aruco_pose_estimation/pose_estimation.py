@@ -7,6 +7,7 @@
 import numpy as np
 import cv2
 import tf_transformations
+from packaging.version import Version
 
 # ROS2 message imports
 from geometry_msgs.msg import Pose
@@ -14,7 +15,7 @@ from geometry_msgs.msg import PoseArray
 from aruco_interfaces.msg import ArucoMarkers
 
 # utils import python code
-from aruco_pose_estimation.utils import aruco_display
+from aruco_pose_estimation.utils import aruco_display, ARUCO_DICT
 
 
 def pose_estimation(frame, aruco_dict_type, aruco_params, aruco_detector, marker_size, calibration_coeff, distortion_coeff, pose_array, markers):
@@ -86,6 +87,156 @@ def pose_estimation(frame, aruco_dict_type, aruco_params, aruco_detector, marker
                 continue
 
     return frame_processed, pose_array, markers
+
+def pose_estimation_single_camera(frame, aruco_dict_type, aruco_params, aruco_detector, marker_size, matrix_coeff, distortion_coeff, pose_array, markers):
+    """
+    frame - Frame from the video stream
+    aruco_dict_type - Type of ArUco dictionary to use
+    aruco_params - Parameters for the ArUco detection
+    aruco_detector - ArUco detector object
+    marker_size - Size of the ArUco marker in meters
+    calibration_coeff - Camera calibration matrix
+    distortion_coeff - Camera distortion coefficients
+    pose_array - PoseArray message to store the poses
+    markers - ArucoMarkers message to store the marker IDs
+
+    Returns:
+    frame - Processed frame with detected markers
+    pose_array - PoseArray message with the detected poses
+    markers - ArucoMarkers message with the detected marker IDs
+
+    """
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    # Detect markers
+    if aruco_detector:
+        corners, marker_ids, _ = aruco_detector.detectMarkers(image=gray)
+    else:
+        corners, marker_ids, _ = cv2.aruco.detectMarkers(gray, aruco_dict_type, parameters=aruco_params)
+
+    frame_processed = frame
+    if marker_ids is not None:
+        for i, marker_id in enumerate(marker_ids):
+            try:
+                # Estimate pose for each marker
+                rvec, tvec, _ = cv2.aruco.estimatePoseSingleMarkers(corners[i], marker_size, matrix_coeff, distortion_coeff)
+                rvec = rvec.reshape(3, 1)
+                tvec = tvec.reshape(3, 1)
+
+                rot, jacobian = cv2.Rodrigues(rvec)
+                rot_matrix = np.eye(4, dtype=np.float32)
+                rot_matrix[0:3, 0:3] = rot
+                #rot_matrix = cv2.Rodrigues(rvec)[0]
+
+                # Convert rotation matrix to quaternion
+                quaternion = tf_transformations.quaternion_from_matrix(rot_matrix)
+                norm_quat = np.linalg.norm(quaternion)
+                quat = quaternion / norm_quat
+
+                # Show the detected markers bounding boxes
+                frame_processed = aruco_display(corners=corners, ids=marker_ids, image=frame_processed)
+
+                # Draw frame axes
+                frame_processed = cv2.drawFrameAxes(image=frame_processed, cameraMatrix=matrix_coeff,
+                                                    distCoeffs=distortion_coeff, rvec=rvec, tvec=tvec,
+                                                    length=0.05, thickness=3)
+
+                pose = Pose()
+                pose.position.x = float(tvec[0])
+                pose.position.y = float(tvec[1])
+                pose.position.z = float(tvec[2])
+                pose.orientation.x = quat[0]
+                pose.orientation.y = quat[1]
+                pose.orientation.z = quat[2]
+                pose.orientation.w = quat[3]
+
+                # add the pose and marker id to the pose_array and markers messages
+                pose_array.poses.append(pose)
+                markers.poses.append(pose)
+                markers.marker_ids.append(marker_id[0])
+
+            except Exception as e:
+                print(f"Error: {e}")
+            continue
+
+    return frame
+
+def pose_estimation_dual_cameras(frame0, frame1, aruco_dict_type, aruco_params, aruco_detector, marker_size, K, D, P, pose_array, markers):
+    """ Pose estimation function for dual-camera stereo setup """
+
+    gray0 = cv2.cvtColor(frame0, cv2.COLOR_BGR2GRAY)
+    gray1 = cv2.cvtColor(frame1, cv2.COLOR_BGR2GRAY)
+
+    # Detect markers in both cameras
+    if aruco_detector:
+        corners0, ids0, _ = aruco_detector.detectMarkers(image=gray0)
+        corners1, ids1, _ = aruco_detector.detectMarkers(image=gray1)
+    else:
+        corners0, ids0, _ = cv2.aruco.detectMarkers(gray0, aruco_dict_type, parameters=aruco_params)
+        corners1, ids1, _ = cv2.aruco.detectMarkers(gray1, aruco_dict_type, parameters=aruco_params)
+
+    if ids0 is not None and ids1 is not None:
+        # Only process common marker IDs between both cameras
+        common_ids = set(ids0.flatten()).intersection(ids1.flatten())
+
+        for marker_id in common_ids:
+            idx0 = list(ids0.flatten()).index(marker_id)
+            idx1 = list(ids1.flatten()).index(marker_id)
+
+            # Estimate the pose for each marker in each camera
+            rvec0, tvec0, _ = cv2.aruco.estimatePoseSingleMarkers(corners0[idx0], marker_size, K[0], D[0])
+            rvec1, tvec1, _ = cv2.aruco.estimatePoseSingleMarkers(corners1[idx1], marker_size, K[1], D[1])
+
+            # Draw markers bounding boxes
+            cv2.aruco.drawDetectedMarkers(frame0, corners0)
+            cv2.aruco.drawDetectedMarkers(frame1, corners1)
+
+            # Draw the frame Axes
+            cv2.drawFrameAxes(frame0, K[0], D[0], rvec0, tvec0, marker_size, thickness=2)
+            cv2.drawFrameAxes(frame1, K[1], D[1], rvec1, tvec1, marker_size, thickness=2)
+
+            # Triangulate the 3D point from the two 2D points
+            #print(P)
+            points4D = cv2.triangulatePoints(
+                np.hstack((np.eye(3), np.zeros((3,1)))),  # Projection matrix for camera 0
+                P,  # Projection matrix for camera 1
+                corners0[idx0].reshape(-1, 2).T,  # 2D point in camera 0
+                corners1[idx1].reshape(-1, 2).T  # 2D point in camera 1
+            )
+            points3D = cv2.convertPointsFromHomogeneous(points4D.T).reshape(-1, 3)
+
+            # Get orientation from camera 1 frame to camera 0 frame
+            rot, jacobian = cv2.Rodrigues(rvec0)
+            rot_matrix = np.eye(4, dtype=np.float32)
+            rot_matrix[0:3, 0:3] = rot
+            # rot_matrix = cv2.Rodrigues(rvec)[0]
+
+            # Convert rotation matrix to quaternion
+            quaternion = tf_transformations.quaternion_from_matrix(rot_matrix)
+            norm_quat = np.linalg.norm(quaternion)
+            quat = quaternion / norm_quat
+
+            # Draw the 3d coordinates
+            cv2.putText(frame0, f"X: {points3D[0][0]:.3f} m", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+            cv2.putText(frame0, f"Y: {points3D[0][1]:.3f} m", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+            cv2.putText(frame0, f"Z: {points3D[0][2]:.3f} m", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+
+            pose = Pose()
+            pose.position.x = float(points3D[0][0])
+            pose.position.y = float(points3D[0][1])
+            pose.position.z = float(points3D[0][2])
+            pose.orientation.x = quat[0]
+            pose.orientation.y = quat[1]
+            pose.orientation.z = quat[2]
+            pose.orientation.w = quat[3]
+
+            # add the pose and marker id to the pose_array and markers messages
+            pose_array.poses.append(pose)
+            markers.poses.append(pose)
+            markers.marker_ids.append(marker_id)
+
+    return frame0, frame1, pose_array, markers
 
 def my_estimatePoseSingleMarkers(corners, marker_size, camera_matrix, distortion):# -> tuple[np.array, np.array, np.array]:
     '''
@@ -239,6 +390,24 @@ def apply_transform_to_pose(pose: Pose, transform: np.array) -> Pose:
 
     return pose_transformed
 
+def transform_all_poses(self, pose_array, origin_transform=None):
+    """
+    Transform all detected marker poses to the origin coordinate frame.
+    :param pose_array: PoseArray to be transformed.
+    :return: Transformed PoseArray.
+    """
+    if origin_transform is None:
+        self.get_logger().warn("Origin is not set. Cannot transform poses.")
+        return pose_array  # Return the original array if no origin is set
+
+    transformed_pose_array = PoseArray()
+    transformed_pose_array.header = pose_array.header
+
+    for pose in pose_array.poses:
+        transformed_pose = apply_transform_to_pose(pose, origin_transform)
+        transformed_pose_array.poses.append(transformed_pose)
+
+    return transformed_pose_array
 
 def pose_to_matrix(position: np.array, orientation: np.array) -> np.array:
     """

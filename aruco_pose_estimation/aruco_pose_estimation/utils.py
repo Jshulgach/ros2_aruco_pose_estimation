@@ -70,3 +70,4 @@ def aruco_display(corners, ids, image):
 
     return image
 
+

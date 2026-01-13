@@ -23,8 +23,10 @@ Published Topics:
 Parameters:
     marker_size - size of the markers in meters (default .065)
     aruco_dictionary_id - dictionary that was used to generate markers (default DICT_5X5_250)
-    image_topic - image topic to subscribe to (default /camera/color/image_raw)
-    camera_info_topic - camera info topic to subscribe to (default /camera/camera_info)
+    camera1_image_topic - image topic to subscribe to (default /camera/color/image_raw)
+    camera2_image_topic - image topic to subscribe to (default /camera/color/image_raw)
+    camera1_info_topic - camera info topic to subscribe to (default /camera/camera_info)
+    camera2_info_topic - camera info topic to subscribe to (default /camera/camera_info)
     camera_frame - camera optical frame to use (default "camera_depth_optical_frame")
     detected_markers_topic - topic to publish detected markers (default /aruco_markers)
     markers_visualization_topic - topic to publish markers visualization (default /aruco_poses)
@@ -41,6 +43,7 @@ import rclpy.node
 from rclpy.qos import qos_profile_sensor_data
 from cv_bridge import CvBridge
 import message_filters
+from packaging.version import Version
 
 # Python imports
 import cv2
@@ -49,214 +52,174 @@ from scipy.spatial.transform import Rotation as R
 
 # Local imports for custom defined functions
 from aruco_pose_estimation.utils import ARUCO_DICT
-from aruco_pose_estimation.pose_estimation import apply_transform_to_pose, pose_to_matrix, pose_estimation
+from aruco_pose_estimation.pose_estimation import (
+    apply_transform_to_pose,
+    pose_to_matrix,
+    pose_estimation_single_camera,
+    pose_estimation_dual_cameras
+)
 
 # ROS2 message imports
-from sensor_msgs.msg import CameraInfo
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import PoseArray, Pose
 from aruco_interfaces.msg import ArucoMarkers
-from rcl_interfaces.msg import ParameterDescriptor, ParameterType
 
 
 class ArucoNode(rclpy.node.Node):
     def __init__(self):
         super().__init__("aruco_node")
-        self.calibration_coeff = None
-        self.distortion_coeff = None
-        self.origin_transform = None
 
         # Initialize ROS2 parameters
         self.initialize_parameters()
 
+        # Initialize publishers and subscribers
+        self.initialize_publishers()
+        self.initialize_subscribers()
+
         # Load the camera calibration parameters
-        self.load_calibration_parameters()
+        #self.load_calibration_parameters()
 
         # Set the origin transformation from the parameters
-        self.set_origin_from_parameters()
+        #self.set_origin_from_parameters()
 
         # Make sure we have a valid dictionary id:
         try:
-            dictionary_id = cv2.aruco.__getattribute__(self.dictionary_id_name)
+            dictionary_id_name = self.get_param("aruco_dictionary_id")
+            dictionary_id = cv2.aruco.__getattribute__(dictionary_id_name)
             # check if the dictionary_id is a valid dictionary inside ARUCO_DICT values
             if dictionary_id not in ARUCO_DICT.values():
                 raise AttributeError
         except AttributeError:
-            self.get_logger().error("bad aruco_dictionary_id: {}".format(self.dictionary_id_name))
+            self.get_logger().error("bad aruco_dictionary_id: {}".format(dictionary_id_name))
             options = "\n".join([s for s in ARUCO_DICT])
             self.get_logger().error("valid options: {}".format(options))
 
-        # Set up subscriptions to the camera info and camera image topics
-        self.image_sub = self.create_subscription(Image, self.image_topic, self.image_cb, qos_profile_sensor_data)
-
-        # Set up publishers
-        self.poses_pub = self.create_publisher(PoseArray, self.markers_visualization_topic, 10)
-        self.markers_pub = self.create_publisher(ArucoMarkers, self.detected_markers_topic, 10)
-        self.image_pub = self.create_publisher(Image, self.output_image_topic, 10)
-
-        # Set up fields for camera parameters
-        self.info_msg = None
-
         # code for updated version of cv2 (4.7.0)
-        if cv2.__version__ >= "4.7.0":
-            self.aruco_dictionary = cv2.aruco.getPredefinedDictionary(dictionary_id)
+        if Version(cv2.__version__) >= Version("4.7.0"):
+            self.aruco_dictionary = cv2.aruco.getPredefinedDictionary(ARUCO_DICT[self.get_param('aruco_dictionary_id')])
             self.aruco_parameters = cv2.aruco.DetectorParameters()
             self.aruco_detector = cv2.aruco.ArucoDetector(self.aruco_dictionary, self.aruco_parameters)
         else:
             # old code version (4.6.0.66 and older)
-            self.aruco_dictionary = cv2.aruco.Dictionary_get(dictionary_id)
+            self.aruco_dictionary = cv2.aruco.Dictionary_get(ARUCO_DICT[self.get_param('aruco_dictionary_id')])
             self.aruco_parameters = cv2.aruco.DetectorParameters_create()
             self.aruco_detector = None
+
+        # Set up fields for camera parameters
+        self.info_msg = None
+        self.intrinsic = []
+        self.distortion = []
+        self.projection = []
 
         self.bridge = CvBridge()
 
     def initialize_parameters(self):
-        # Declare and read parameters from aruco_params.yaml
-        self.declare_parameter(
-            name="marker_size",
-            value=0.0625,
-            descriptor=ParameterDescriptor(
-                type=ParameterType.PARAMETER_DOUBLE,
-                description="Size of the markers in meters.",
-            ),
+        # Declare and read parameters from aruco params.yaml
+        # Aruco detection parameters
+        self.declare_parameter("marker_size", 0.0625)
+        self.declare_parameter("aruco_dictionary_id", "DICT_5X5_100")
+
+        # Input topics
+        self.declare_parameter("camera_frame", "")
+        self.declare_parameter("dual_cameras", False)
+        self.declare_parameter("camera1_image_topic", "/camera1/color/image_raw")
+        self.declare_parameter("camera1_info_topic", "/camera1/color/camera_info")  # Camera intrinsic parameters
+        self.get_logger().info(f"Camera 1 input image topic: {self.get_param('camera1_image_topic')}")
+        if self.get_param("dual_cameras"):
+            self.declare_parameter("camera2_image_topic", "/camera2/color/image_raw")
+            self.declare_parameter("camera2_info_topic", "/camera2/color/camera_info")  # Camera intrinsic parameters
+            self.get_logger().info(f"Camera 2 input image topic: {self.get_param('camera2_image_topic')}")
+
+        # Output topics
+        self.declare_parameter("detected_markers_topic", "/aruco_markers")
+        self.declare_parameter("markers_visualization_topic", "/aruco_poses")
+        self.declare_parameter("output1_image_topic", "/aruco/camera1/image")
+        if self.get_param("dual_cameras"):
+            self.declare_parameter("output2_image_topic", "/aruco/camera2/image")
+
+        self.declare_parameter("origin_position", [0.0, 0.0, 0.0])  # Default position
+        self.declare_parameter("origin_orientation", [0.0, 0.0, 0.0, 1.0])  # Default quaternion [x, y, z, w]
+
+        self.get_logger().info(f"Dual cameras: {self.get_param('dual_cameras')}")
+        self.get_logger().info(f"Marker size: {self.get_param('marker_size')}")
+        self.get_logger().info(f"Camera frame: {self.get_param('camera_frame')}")
+        self.get_logger().info(f"Detected markers topic: {self.get_param('detected_markers_topic')}")
+        self.get_logger().info(f"Markers visualization topic: {self.get_param('markers_visualization_topic')}")
+        #self.get_logger().info(f"Output image topic: {self.get_param('output_image_topic')}")
+        #self.get_logger().info(f"Origin position: {self.get_param('origin_position')}")
+        #self.get_logger().info(f"Origin orientation: {self.get_param('origin_orientation')}")
+
+    def initialize_publishers(self):
+        # Set up publishers
+        self.poses_pub = self.create_publisher(PoseArray, self.get_param('markers_visualization_topic'), 10)
+        self.markers_pub = self.create_publisher(ArucoMarkers, self.get_param('detected_markers_topic'), 10)
+        self.image1_pub = self.create_publisher(Image, self.get_param('output1_image_topic'), 10)
+        if self.get_param("dual_cameras"):
+            self.image2_pub = self.create_publisher(Image, self.get_param('output2_image_topic'), 10)
+
+    def initialize_subscribers(self):
+        # Set up subscriptions to the camera info and camera image topics
+        self.info1_sub = self.create_subscription(
+            CameraInfo, self.get_param('camera1_info_topic'), self.camera1_info_cb, qos_profile_sensor_data
         )
 
-        self.declare_parameter(
-            name="aruco_dictionary_id",
-            value="DICT_5X5_100",
-            descriptor=ParameterDescriptor(
-                type=ParameterType.PARAMETER_STRING,
-                description="Dictionary that was used to generate markers.",
-            ),
-        )
-
-        self.declare_parameter(
-            name="image_topic",
-            value="/camera/color/image_raw",
-            descriptor=ParameterDescriptor(
-                type=ParameterType.PARAMETER_STRING,
-                description="Image topic to subscribe to.",
-            ),
-        )
-
-        self.declare_parameter(
-            name="camera_info_topic",
-            value="/camera/camera_info",
-            descriptor=ParameterDescriptor(
-                type=ParameterType.PARAMETER_STRING,
-                description="Camera info topic to subscribe to.",
-            ),
-        )
-
-        self.declare_parameter(
-            name="camera_frame",
-            value="",
-            descriptor=ParameterDescriptor(
-                type=ParameterType.PARAMETER_STRING,
-                description="Camera optical frame to use.",
-            ),
-        )
-
-        self.declare_parameter(
-            name="detected_markers_topic",
-            value="/aruco_markers",
-            descriptor=ParameterDescriptor(
-                type=ParameterType.PARAMETER_STRING,
-                description="Topic to publish detected markers as array of marker ids and poses",
-            ),
-        )
-
-        self.declare_parameter(
-            name="markers_visualization_topic",
-            value="/aruco_poses",
-            descriptor=ParameterDescriptor(
-                type=ParameterType.PARAMETER_STRING,
-                description="Topic to publish markers as pose array",
-            ),
-        )
-
-        self.declare_parameter(
-            name="output_image_topic",
-            value="/aruco_image",
-            descriptor=ParameterDescriptor(
-                type=ParameterType.PARAMETER_STRING,
-                description="Topic to publish annotated images with markers drawn on them",
-            ),
-        )
-
-        self.declare_parameter(
-            name="calibration_coefficients_file",
-            value="",
-            descriptor=ParameterDescriptor(
-                type=ParameterType.PARAMETER_STRING,
-                description=".npy file containing the camera calibration matrix",
-            ),
-        )
-
-        self.declare_parameter(
-            name="distortion_coefficients_file",
-            value="",
-            descriptor=ParameterDescriptor(
-                type=ParameterType.PARAMETER_STRING,
-                description=".npy file containing the camera distortion coefficients",
-            ),
-        )
-
-        self.declare_parameter(
-            name="origin_position",
-            value=[0.0, 0.0, 0.0],  # Default position
-            descriptor=ParameterDescriptor(
-                type=ParameterType.PARAMETER_DOUBLE_ARRAY,
-                description="Origin position [x, y, z] in meters."
+        if not self.get_param("dual_cameras"):
+            self.image1_sub = self.create_subscription(
+                Image, self.get_param('camera1_image_topic'), self.single_camera_image_cb, qos_profile_sensor_data
             )
-        )
-
-        self.declare_parameter(
-            name="origin_orientation",
-            value=[0.0, 0.0, 0.0, 1.0],  # Default quaternion [x, y, z, w]
-            descriptor=ParameterDescriptor(
-                type=ParameterType.PARAMETER_DOUBLE_ARRAY,
-                description="Origin orientation [x, y, z, w] quaternion."
+        else:
+            self.info2_sub = self.create_subscription(
+                CameraInfo, self.get_param('camera2_info_topic'), self.camera2_info_cb, qos_profile_sensor_data
             )
-        )
+            self.image1_sub = message_filters.Subscriber(self, Image, self.get_param('camera1_image_topic'),
+                                                         qos_profile=qos_profile_sensor_data)
+            self.image2_sub = message_filters.Subscriber(self, Image, self.get_param('camera2_image_topic'),
+                                                         qos_profile=qos_profile_sensor_data)
+            # Create synchronizer between image topics using message filters and approximate time
+            self.synchronizer = message_filters.ApproximateTimeSynchronizer(
+                [self.image1_sub, self.image2_sub], queue_size=10, slop=0.1  # slop is max time diff between messages
+            )
+            self.synchronizer.registerCallback(self.dual_camera_image_cb)
 
-        # read parameters from aruco_params.yaml and store them
-        self.marker_size = self.get_parameter("marker_size").get_parameter_value().double_value
-        self.dictionary_id_name = self.get_parameter("aruco_dictionary_id").get_parameter_value().string_value
-        self.image_topic = self.get_parameter("image_topic").get_parameter_value().string_value
-        self.camera_frame = self.get_parameter("camera_frame").get_parameter_value().string_value
-        self.detected_markers_topic = self.get_parameter("detected_markers_topic").get_parameter_value().string_value
-        self.markers_visualization_topic = self.get_parameter("markers_visualization_topic").get_parameter_value().string_value
-        self.output_image_topic = self.get_parameter("output_image_topic").get_parameter_value().string_value
-        self.origin_position = self.get_parameter("origin_position").get_parameter_value().double_array_value
-        self.origin_orientation = self.get_parameter("origin_orientation").get_parameter_value().double_array_value
+    def camera1_info_cb(self, msg: CameraInfo):
+        self.info_msg = msg
+        self.intrinsic.append(np.reshape(np.array(msg.k), (3, 3)))
+        self.distortion.append(np.array(msg.d))
+        self.projection.append(np.reshape(np.array(msg.p), (3, 4)))
 
-        self.get_logger().info(f"Marker size: {self.marker_size}")
-        self.get_logger().info(f"Input image topic: {self.image_topic}")
-        self.get_logger().info(f"Camera frame: {self.camera_frame}")
-        self.get_logger().info(f"Detected markers topic: {self.detected_markers_topic}")
-        self.get_logger().info(f"Markers visualization topic: {self.markers_visualization_topic}")
-        self.get_logger().info(f"Output image topic: {self.output_image_topic}")
-        self.get_logger().info(f"Origin position: {self.origin_position}")
-        self.get_logger().info(f"Origin orientation: {self.origin_orientation}")
+        self.logger("Camera 1 intrinsic parameters received")
+        self.logger("Intrinsic matrix: {}".format(self.intrinsic[0]))
+        self.logger("Distortion coefficients: {}".format(self.distortion[0]))
+        self.logger("Projection matrix: {}".format(self.projection[0]))
+        self.info1_sub.destroy()
 
-    def load_calibration_parameters(self):
-        calibration_file = self.get_parameter("calibration_coefficients_file").get_parameter_value().string_value
-        distortion_file = self.get_parameter("distortion_coefficients_file").get_parameter_value().string_value
-        print("calibration_file: ", calibration_file)
-        print("distortion_file: ", distortion_file)
+    def camera2_info_cb(self, msg: CameraInfo):
+        self.info_msg = msg
+        self.intrinsic.append(np.reshape(np.array(msg.k), (3, 3)))
+        self.distortion.append(np.array(msg.d))
+        self.projection.append(np.reshape(np.array(msg.p), (3, 4)))
 
-        # load the calibration matrix and distortion coefficients from the files
-        try:
-            self.calibration_coeff = np.load(calibration_file)
-            self.distortion_coeff = np.load(distortion_file)
-            self.get_logger().info("Camera calibration parameters loaded.")
-            self.get_logger().info("Calibration coefficients: \n{}".format(self.calibration_coeff))
-            self.get_logger().info("Distortion coefficients: {}".format(self.distortion_coeff))
-        except Exception as e:
-            self.get_logger().error("Error loading calibration parameters: {}".format(e))
+        self.logger("Camera 2 intrinsic parameters received")
+        self.logger("Intrinsic matrix: {}".format(self.intrinsic[1]))
+        self.logger("Distortion coefficients: {}".format(self.distortion[1]))
+        self.logger("Projection matrix: {}".format(self.projection[1]))
+        self.info2_sub.destroy()
 
-    def image_cb(self, img_msg: Image):
+    def logger(self, *argv, msg_type='info'):
+        """ Robust printing function to log events"""
+        msg = ''.join(argv)
+        if msg_type == 'info':
+            self.get_logger().info(msg)
+        elif msg_type == 'warn' or msg_type == 'warning':
+            self.get_logger().warn(msg)
+        elif msg_type == 'error' or msg_type == 'err':
+            self.get_logger().error(msg)
+
+    def get_param(self, name):
+        # Helper function to get the ROS2 parameter by key name
+        return self.get_parameter(name).value
+
+    def single_camera_image_cb(self, img_msg: Image):
 
         # convert the image messages to cv2 format
         cv_image = self.bridge.imgmsg_to_cv2(img_msg, desired_encoding="rgb8")
@@ -266,14 +229,13 @@ class ArucoNode(rclpy.node.Node):
         pose_array = PoseArray()
 
         # Set the frame id and timestamp for the markers and pose array
-        if self.camera_frame == "":
+        camera_frame = self.get_param('camera_frame')
+        if camera_frame == "":
             markers.header.frame_id = self.info_msg.header.frame_id
             pose_array.header.frame_id = self.info_msg.header.frame_id
         else:
-            #markers.header.frame_id = "world"
-            #pose_array.header.frame_id = "/world"
-            markers.header.frame_id = self.camera_frame
-            pose_array.header.frame_id = self.camera_frame
+            markers.header.frame_id = camera_frame
+            pose_array.header.frame_id = camera_frame
 
         # Check if the stamp field sec or nanosec are both zero then add the current time
         if img_msg.header.stamp.sec == 0 and img_msg.header.stamp.nanosec == 0:
@@ -285,60 +247,87 @@ class ArucoNode(rclpy.node.Node):
         pose_array.header.stamp = img_msg.header.stamp
 
         # call the pose estimation function
-        frame, pose_array, markers = pose_estimation(frame=cv_image,
-                                                     aruco_dict_type=self.aruco_dictionary,
-                                                     aruco_params=self.aruco_parameters,
-                                                     aruco_detector=self.aruco_detector,
-                                                     marker_size=self.marker_size,
-                                                     calibration_coeff=self.calibration_coeff,
-                                                     distortion_coeff=self.distortion_coeff,
-                                                     pose_array=pose_array,
-                                                     markers=markers)
+        frame, pose_array, markers = pose_estimation_single_camera(
+            frame=cv_image,
+            aruco_dict_type=self.aruco_dictionary,
+            aruco_params=self.aruco_parameters,
+            aruco_detector=self.aruco_detector,
+            marker_size=self.get_param('marker_size'),
+            calibration_coeff=self.intrinsic,
+            distortion_coeff=self.distortion,
+            pose_array=pose_array,
+            markers=markers
+        )
 
         if len(markers.marker_ids) > 0:
-            # Transform poses relative to the origin
-            transformed_pose_array = self.transform_all_poses(pose_array)
-
-            # Publish the results with the poses and markes positions
-            self.poses_pub.publish(transformed_pose_array)
+            # Publish the results with the poses and marker positions
+            self.poses_pub.publish(pose_array)
             self.markers_pub.publish(markers)
 
         # publish the image frame with computed markers positions over the image
-        self.image_pub.publish(self.bridge.cv2_to_imgmsg(frame, "rgb8"))
+        self.image1_pub.publish(self.bridge.cv2_to_imgmsg(frame, "rgb8"))
 
-    def set_origin_from_parameters(self):
-        """ Sets th origin transformation using the position and orientation form the parameters. """
-        self.origin_transform = pose_to_matrix(self.origin_position, self.origin_orientation)
-        self.get_logger().info("Origin set to: {}".format(self.origin_transform))
+    def dual_camera_image_cb(self, img_msg1: Image, img_msg2: Image):
+        # convert the image messages to cv2 format
+        cv_image1 = self.bridge.imgmsg_to_cv2(img_msg1, desired_encoding="rgb8")
+        cv_image2 = self.bridge.imgmsg_to_cv2(img_msg2, desired_encoding="rgb8")
 
-    def transform_all_poses(self, pose_array):
-        """
-        Transform all detected marker poses to the origin coordinate frame.
-        :param pose_array: PoseArray to be transformed.
-        :return: Transformed PoseArray.
-        """
-        if self.origin_transform is None:
-            self.get_logger().warn("Origin is not set. Cannot transform poses.")
-            return pose_array  # Return the original array if no origin is set
+        # create the ArucoMarkers and PoseArray messages
+        markers = ArucoMarkers()
+        pose_array = PoseArray()
 
-        transformed_pose_array = PoseArray()
-        transformed_pose_array.header = pose_array.header
+        # Set the frame id and timestamp for the markers and pose array
+        camera_frame = self.get_param('camera_frame')
+        if camera_frame == "":
+            markers.header.frame_id = self.info_msg.header.frame_id
+            pose_array.header.frame_id = self.info_msg.header.frame_id
+        else:
+            markers.header.frame_id = camera_frame
+            pose_array.header.frame_id = camera_frame
 
-        for pose in pose_array.poses:
-            transformed_pose = apply_transform_to_pose(pose, self.origin_transform)
-            transformed_pose_array.poses.append(transformed_pose)
+        # Check if the stamp field sec or nanosec are both zero then add the current time
+        if img_msg1.header.stamp.sec == 0 and img_msg1.header.stamp.nanosec == 0:
+            img_msg1.header.stamp = self.get_clock().now().to_msg()
+        else:
+            img_msg1.header.stamp = img_msg1.header.stamp
 
-        return transformed_pose_array
+        markers.header.stamp = img_msg1.header.stamp
+        pose_array.header.stamp = img_msg1.header.stamp
 
+        # call the pose estimation function
+        if len(self.intrinsic) == 0 and len(self.distortion) == 0 and len(self.projection) == 0:
+            return
+
+        #self.get_logger().info(f"P: {self.projection}")
+        frame1, frame2, pose_array, markers = pose_estimation_dual_cameras(
+            frame0=cv_image1, frame1=cv_image2,
+            aruco_dict_type=self.aruco_dictionary,
+            aruco_params=self.aruco_parameters,
+            aruco_detector=self.aruco_detector,
+            marker_size=self.get_param('marker_size'),
+            K=self.intrinsic, D=self.distortion, P=self.projection[0],  # identical projection
+            pose_array=pose_array, markers=markers
+        )
+
+        if len(markers.marker_ids) > 0:
+            # Publish the results with the poses and marker positions
+            self.poses_pub.publish(pose_array)
+            self.markers_pub.publish(markers)
+
+        # publish the image frame with computed markers positions over the image
+        self.image1_pub.publish(self.bridge.cv2_to_imgmsg(frame1, "rgb8"))
+        self.image2_pub.publish(self.bridge.cv2_to_imgmsg(frame2, "rgb8"))
 
 def main():
     rclpy.init()
     node = ArucoNode()
-    rclpy.spin(node)
-
-    node.destroy_node()
-    rclpy.shutdown()
-
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        #rclpy.shutdown()
 
 if __name__ == "__main__":
     main()
